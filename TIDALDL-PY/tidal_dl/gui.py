@@ -10,6 +10,7 @@
 """
 import importlib
 import sys
+import traceback
 
 from events import *
 from printf import *
@@ -28,11 +29,80 @@ if not enableGui():
     def startGui():
         Printf.err("Not support gui. Please type: `pip3 install PyQt5 qt_material`")
 else:
-    from PyQt5.QtCore import Qt, QObject
+    from PyQt5.QtCore import Qt, QObject, QRunnable, pyqtSignal, pyqtSlot, QThreadPool
     from PyQt5.QtGui import QTextCursor, QKeyEvent
-    from PyQt5.QtCore import pyqtSignal
     from PyQt5 import QtWidgets
     from qt_material import apply_stylesheet
+
+
+    class WorkerSignals(QObject):
+        """
+        Defines the signals available from a running worker thread.
+
+        Supported signals are:
+
+        finished
+            No data
+
+        error
+            tuple (exctype, value, traceback.format_exc() )
+
+        result
+            object data returned from processing, anything
+
+        progress
+            int indicating % progress
+        """
+        finished = pyqtSignal()
+        error = pyqtSignal(tuple)
+        result = pyqtSignal(object)
+        progress = pyqtSignal(str)
+
+
+    class Worker(QRunnable):
+        """
+        Worker thread
+
+        Inherits from QRunnable to handler worker thread setup, signals and wrap-up.
+
+        :param callback: The function callback to run on this worker thread. Supplied args and
+                         kwargs will be passed through to the runner.
+        :type callback: function
+        :param args: Arguments to pass to the callback function
+        :param kwargs: Keywords to pass to the callback function
+        """
+
+        def __init__(self, fn, *args, **kwargs):
+            super(Worker, self).__init__()
+
+            # Store constructor arguments (re-used for processing)
+            self.fn = fn
+            self.args = args
+            self.kwargs = kwargs
+            self.signals = WorkerSignals()
+
+            # Add the callback to our kwargs
+            # self.kwargs['progress_callback'] = self.signals.progress
+
+        @pyqtSlot()
+        def run(self):
+            """
+            Initialise the runner function with passed args, kwargs.
+            """
+
+            # Retrieve args/kwargs here; and fire processing using them
+            try:
+                result = self.fn(*self.args, **self.kwargs)
+            except:
+                traceback.print_exc()
+                exctype, value = sys.exc_info()[:2]
+                self.signals.error.emit((exctype, value, traceback.format_exc()))
+            else:
+                # Return the result of the processing
+                self.signals.result.emit(result)
+            finally:
+                # Done
+                self.signals.finished.emit()
 
 
     class SettingView(QtWidgets.QWidget):
@@ -68,6 +138,9 @@ else:
             self.initView()
             self.setMinimumSize(800, 620)
             self.setWindowTitle("Tidal-dl")
+
+            self.threadpool = QThreadPool()
+            print("Multithreading with maximum %d threads" % self.threadpool.maxThreadCount())
 
         def __info__(self, msg):
             QtWidgets.QMessageBox.information(self, 'Info', msg, QtWidgets.QMessageBox.Yes)
@@ -164,7 +237,7 @@ else:
             # connect
             self.c_btnSearch.clicked.connect(self.search)
             self.c_lineSearch.returnPressed.connect(self.search)
-            self.c_btnDownload.clicked.connect(self.download)
+            self.c_btnDownload.clicked.connect(self.download_thread)
             self.s_downloadEnd.connect(self.downloadEnd)
             self.c_combTQuality.currentIndexChanged.connect(self.changeTQuality)
             self.c_combVQuality.currentIndexChanged.connect(self.changeVQuality)
@@ -242,7 +315,32 @@ else:
                     self.addItem(index, 3, '')
             self.c_tableInfo.viewport().update()
 
+        def progress_fn(self, msg):
+            Printf.info(msg)
+
+        def print_output(self, s):
+            Printf.info(s)
+
+        def thread_complete(self):
+            self.c_btnDownload.setEnabled(True)
+            self.c_btnDownload.setText(f"Download")
+            Printf.info("THREAD COMPLETE!")
+
+        def download_thread(self):
+            # Pass the function to execute
+            # Any other args, kwargs are passed to the run function
+            worker = Worker(self.download)
+            # worker.signals.result.connect(self.print_output)
+            worker.signals.finished.connect(self.thread_complete)
+            # worker.signals.progress.connect(self.progress_fn)
+
+            # Execute
+            self.threadpool.start(worker)
+
         def download(self):
+            self.c_btnDownload.setEnabled(False)
+            self.c_btnDownload.setText(f"DOWNLOADING...")
+
             index = self.c_tableInfo.currentIndex().row()
             selection = self.c_tableInfo.selectionModel()
             has_selection = selection.hasSelection()
@@ -261,15 +359,13 @@ else:
                 self.download_item(item, item_type)
 
         def download_item(self, item, item_type):
-                self.c_btnDownload.setEnabled(False)
-                item_to_download = ""
-                if isinstance(item, Artist):
-                    item_to_download = item.name
-                else:
-                    item_to_download = item.title
+            item_to_download = ""
+            if isinstance(item, Artist):
+                item_to_download = item.name
+            else:
+                item_to_download = item.title
 
-                self.c_btnDownload.setText(f"'{item_to_download}' ...")
-                self.download_(item, item_type)
+            self.download_(item, item_type)
 
         # Not race condition safe. Needs refactoring.
         def download_(self, item, s_type):
@@ -289,8 +385,6 @@ else:
                 self.s_downloadEnd.emit(downloading_item, False, str(e))
 
         def downloadEnd(self, title, result, msg):
-            self.c_btnDownload.setEnabled(True)
-            self.c_btnDownload.setText(f"Download")
 
             if result:
                 Printf.info(f"Download '{title}' finished.")
@@ -335,20 +429,30 @@ else:
             if not index.isValid():
                 return
 
+            # We build the menu.
+            menu = QtWidgets.QMenu()
+            action = menu.addAction("Dowload Playlist", lambda: self.download_playlist_thread(point))
+
+            menu.exec_(self.tree_playlists.mapToGlobal(point))
+
+        def download_playlist_thread(self, point):
+            # Any other args, kwargs are passed to the run function
+            worker = Worker(self.download_playlist, point)
+            worker.signals.finished.connect(self.thread_complete)
+
+            # Execute
+            self.threadpool.start(worker)
+
+        def download_playlist(self, point):
             item = self.tree_playlists.itemAt(point)
             playlist = Playlist()
             playlist.title = item.text(0)
             playlist.uuid = item.text(2)
 
-            # We build the menu.
-            menu = QtWidgets.QMenu()
-            action = menu.addAction("Dowload Playlist")
-
-            menu.exec_(self.tree_playlists.mapToGlobal(point))
+            self.c_btnDownload.setEnabled(False)
+            self.c_btnDownload.setText(f"DOWNLOADING...")
 
             self.download_item(playlist, Type.Playlist)
-
-
 
 
     def startGui():
